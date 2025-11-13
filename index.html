@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8"/>
 <meta name="viewport" content="width=device-width,initial-scale=1"/>
-<title>Metadata.dat Compare — show only changed strings</title>
+<title>Metadata Compare — improved matching</title>
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&display=swap" rel="stylesheet">
 <style>
   :root{--bg:#071827;--panel:#0b1220;--muted:#9aa6bf;--accent:#7dd3fc}
@@ -28,8 +28,8 @@
   <div class="wrap">
     <header>
       <div>
-        <h1>Metadata Compare — show only changed strings</h1>
-        <div class="muted">Load two metadata files (original & modified). Output will list only strings that changed, were added or removed — nothing else.</div>
+        <h1>Metadata Compare — improved matching</h1>
+        <div class="muted">Load two metadata files (original & modified). Output lists only Changed / Added / Removed strings.</div>
       </div>
     </header>
 
@@ -55,7 +55,7 @@
         <div style="margin-left:auto" class="small muted" id="status">No files loaded</div>
       </div>
 
-      <div class="note">Output: only changed strings are shown below. Format is concise: offset(s), encoding, then original → modified (or Added / Removed). Newlines are preserved.</div>
+      <div class="note">Output: only changed strings. If too noisy, raise "Min string length" or lower the similarity threshold in the script below.</div>
 
       <div style="margin-top:12px">
         <textarea id="out" placeholder="Output will appear here — only changed strings..." readonly></textarea>
@@ -64,45 +64,33 @@
   </div>
 
 <script>
-/* helpers */
+/* Helpers and extraction (ASCII + UTF-16LE) */
 function isPrintable(b){ return b >= 32 && b <= 126; }
-function decodeAscii(bytes){ return new TextDecoder('latin1').decode(bytes); }
-function decodeUtf16le(bytes){ return new TextDecoder('utf-16le').decode(bytes); }
+function decodeAscii(bytes){ try { return new TextDecoder('latin1').decode(bytes); } catch(e){ return String.fromCharCode(...bytes); } }
+function decodeUtf16le(bytes){ try { return new TextDecoder('utf-16le').decode(bytes); } catch(e){ 
+  // fallback simple
+  let s = '';
+  for(let i=0;i+1<bytes.length;i+=2){ const c = bytes[i] | (bytes[i+1]<<8); s += String.fromCharCode(c); } return s;
+} }
 
-function encodePrintableRuns(u8, minLen){
-  const runs = [];
-  let i = 0;
-  const total = u8.length;
-  while (i < total) {
-    if (isPrintable(u8[i])) {
-      const start = i;
-      while (i < total && isPrintable(u8[i])) i++;
-      const len = i - start;
-      if (len >= minLen) {
-        runs.push({offset: start, length: len, encoding: 'ASCII', text: decodeAscii(u8.slice(start, i))});
-      }
-      continue;
-    }
-    i++;
+function extractAsciiRuns(u8, minLen){
+  const runs=[]; let i=0;
+  while(i<u8.length){
+    if(isPrintable(u8[i])){
+      const start=i; while(i<u8.length && isPrintable(u8[i])) i++;
+      const len=i-start; if(len>=minLen) runs.push({offset:start,length:len,encoding:'ASCII',text:normalizeStr(decodeAscii(u8.slice(start,i)))});
+    } else i++;
   }
   return runs;
 }
-function encodeUtf16leRuns(u8, minChars){
-  const runs = [];
-  let i = 0;
-  const total = u8.length;
-  while (i + 1 < total) {
-    if (isPrintable(u8[i]) && u8[i+1] === 0) {
-      const start = i;
-      let chars = 0;
-      while (i + 1 < total && isPrintable(u8[i]) && u8[i+1] === 0) { chars++; i += 2; }
-      if (chars >= minChars) {
-        const bytes = u8.slice(start, start + chars*2);
-        runs.push({offset: start, length: bytes.length, encoding: 'UTF-16LE', text: decodeUtf16le(bytes)});
-      }
-      continue;
-    }
-    i++;
+function extractUtf16leRuns(u8,minChars){
+  const runs=[]; let i=0;
+  while(i+1<u8.length){
+    if(isPrintable(u8[i]) && u8[i+1]===0){
+      const start=i; let chars=0;
+      while(i+1<u8.length && isPrintable(u8[i]) && u8[i+1]===0){ chars++; i+=2; }
+      if(chars>=minChars){ const b=u8.slice(start,start+chars*2); runs.push({offset:start,length:chars*2,encoding:'UTF-16LE',text:normalizeStr(decodeUtf16le(b))}); }
+    } else i++;
   }
   return runs;
 }
@@ -110,13 +98,44 @@ function encodeUtf16leRuns(u8, minChars){
 function uniqueByOffset(list){
   list.sort((a,b)=>a.offset - b.offset || b.length - a.length);
   const out=[]; const seen=new Set();
-  for(const it of list){ if(!seen.has(it.offset)){ out.push(it); seen.add(it.offset);} }
+  for(const it of list){ if(!seen.has(it.offset)){ out.push(it); seen.add(it.offset); } }
   return out;
 }
 
-/* file handling */
+function normalizeStr(s){
+  if(!s) return '';
+  // trim and collapse multiple spaces, remove trailing nulls
+  return s.replace(/\u0000/g,'').replace(/\r/g,'').replace(/\t/g,' ').split('\n').map(x=>x.replace(/\s+/g,' ').trim()).join('\n').trim();
+}
+
+/* Levenshtein distance (for similarity) */
+function lev(a,b){
+  if(a===b) return 0;
+  const n=a.length, m=b.length;
+  if(n===0) return m;
+  if(m===0) return n;
+  const dp = new Array(n+1);
+  for(let i=0;i<=n;i++){ dp[i]=new Array(m+1); dp[i][0]=i; }
+  for(let j=0;j<=m;j++) dp[0][j]=j;
+  for(let i=1;i<=n;i++){
+    for(let j=1;j<=m;j++){
+      const cost = a[i-1]===b[j-1] ? 0 : 1;
+      dp[i][j] = Math.min(dp[i-1][j]+1, dp[i][j-1]+1, dp[i-1][j-1]+cost);
+    }
+  }
+  return dp[n][m];
+}
+function similarity(a,b){
+  if(!a && !b) return 1;
+  const L = Math.max(a.length, b.length);
+  if(L===0) return 1;
+  const d = lev(a,b);
+  return 1 - (d / L);
+}
+
+/* File inputs + UI */
 const fileOrig = document.getElementById('fileOrig');
-const fileMod = document.getElementById('fileMod');
+const fileMod  = document.getElementById('fileMod');
 const btnCompare = document.getElementById('btnCompare');
 const btnClear = document.getElementById('btnClear');
 const out = document.getElementById('out');
@@ -143,142 +162,117 @@ function loadBothBuffersThen(action){
   });
 }
 
-btnCompare.addEventListener('click', ()=>{
-  loadBothBuffersThen(runCompare);
-});
-
+btnCompare.addEventListener('click', ()=>loadBothBuffersThen(runCompare));
 btnClear.addEventListener('click', ()=>{
-  out.value = '';
-  lastResultText = '';
-  fileOrig.value = '';
-  fileMod.value = '';
-  origBuf = null; modBuf = null;
-  status.textContent = 'Cleared';
+  out.value=''; lastResultText=''; fileOrig.value=''; fileMod.value=''; origBuf=null; modBuf=null; status.textContent='Cleared';
 });
-
 btnDownload.addEventListener('click', ()=>{
   if(!lastResultText){ alert('No output to download'); return; }
-  const blob = new Blob([lastResultText], {type:'text/plain'});
-  const url = URL.createObjectURL(blob);
-  const a = document.createElement('a');
-  a.href = url; a.download = 'changed_strings.txt';
-  document.body.appendChild(a); a.click(); a.remove(); URL.revokeObjectURL(url);
+  const blob = new Blob([lastResultText], {type:'text/plain'}); const url = URL.createObjectURL(blob);
+  const a = document.createElement('a'); a.href = url; a.download = 'changed_strings.txt'; document.body.appendChild(a); a.click(); a.remove(); URL.revokeObjectURL(url);
 });
 
-/* comparison algorithm:
-   - extract ASCII & UTF16LE runs from both
-   - index by offset+encoding
-   - primary match: identical offset & encoding
-   - fallback: nearest offset within window (16)
-   - report only segments where text differs
-   - also report Added (present in modified but not matched) and Removed (present in original but not matched)
-*/
+/* Main compare logic with improved heuristics */
 function runCompare(){
-  out.value = '';
-  if(!origBuf || !modBuf){
-    status.textContent = 'Load both original and modified files first';
-    return;
-  }
+  out.value=''; lastResultText='';
+  if(!origBuf || !modBuf){ status.textContent='Load both files'; return; }
   const minLen = Math.max(4, parseInt(document.getElementById('minLen').value || '24',10));
-  const minUtfChars = Math.floor(minLen/2);
+  const minUtf = Math.floor(minLen/2);
+  status.textContent='Extracting printable runs...';
 
-  status.textContent = 'Extracting runs...';
+  let origSegments = uniqueByOffset(extractAsciiRuns(origBuf, minLen).concat(extractUtf16leRuns(origBuf, minUtf)));
+  let modSegments  = uniqueByOffset(extractAsciiRuns(modBuf, minLen).concat(extractUtf16leRuns(modBuf, minUtf)));
 
-  const origAscii = encodePrintableRuns(origBuf, minLen);
-  const origUtf = encodeUtf16leRuns(origBuf, minUtfChars);
-  const modAscii = encodePrintableRuns(modBuf, minLen);
-  const modUtf = encodeUtf16leRuns(modBuf, minUtfChars);
+  status.textContent = `Found ${origSegments.length} orig runs, ${modSegments.length} mod runs — matching...`;
 
-  let origSegments = uniqueByOffset(origAscii.concat(origUtf));
-  let modSegments = uniqueByOffset(modAscii.concat(modUtf));
+  // quick map for exact offset+encoding
+  const modMap = new Map();
+  for(const m of modSegments) modMap.set(`${m.offset}:${m.encoding}`, m);
 
-  // build quick maps by offset-> segment(s)
-  const modByOffset = new Map();
-  for(const s of modSegments){
-    const key = `${s.offset}:${s.encoding}`;
-    modByOffset.set(key, s);
-  }
-
-  const matchedModOffsets = new Set();
+  const matchedModKeys = new Set();
+  const matchedOrigKeys = new Set();
   const changes = [];
+  const WINDOW = 64;            // search window in bytes
+  const SIM_THRESH = 0.50;      // similarity threshold to consider as 'Changed' (0..1)
 
-  // primary pass: exact offset+encoding matches
+  // 1) exact offset+encoding matches: if identical text -> ignore; if different -> Changed
   for(const o of origSegments){
-    const key = `${o.offset}:${o.encoding}`;
-    if(modByOffset.has(key)){
-      const m = modByOffset.get(key);
-      matchedModOffsets.add(key);
+    const k = `${o.offset}:${o.encoding}`;
+    if(modMap.has(k)){
+      const m = modMap.get(k);
+      matchedModKeys.add(k);
+      matchedOrigKeys.add(k);
       if(o.text !== m.text){
-        changes.push({type:'Changed', orig:o, mod:m});
+        changes.push({type:'Changed', orig:o, mod:m, sim: similarity(o.text, m.text)});
       }
+    }
+  }
+
+  // 2) for unmatched orig segments, try best candidate in mod (windowed search) using similarity
+  for(const o of origSegments){
+    const kO = `${o.offset}:${o.encoding}`;
+    if(matchedOrigKeys.has(kO)) continue; // already handled
+    let best = null;
+    for(const m of modSegments){
+      if(matchedModKeys.has(`${m.offset}:${m.encoding}`)) continue; // already paired
+      if(m.encoding !== o.encoding) continue;
+      if(Math.abs(m.offset - o.offset) > WINDOW) continue;
+      const sim = similarity(o.text, m.text);
+      if(!best || sim > best.sim) best = {seg:m, sim};
+    }
+    if(best && best.sim >= SIM_THRESH){
+      // treat as Changed (moved/shifted)
+      const m = best.seg;
+      matchedModKeys.add(`${m.offset}:${m.encoding}`);
+      matchedOrigKeys.add(kO);
+      changes.push({type:'Changed', orig:o, mod:m, sim: best.sim});
     } else {
-      // fallback: look for a mod segment with same encoding within ±16 bytes
-      const window = 16;
-      let found = null;
-      for(const candidate of modSegments){
-        if(candidate.encoding !== o.encoding) continue;
-        if(Math.abs(candidate.offset - o.offset) <= window && candidate.length === o.length){
-          found = candidate; break;
-        }
-      }
-      if(found){
-        const k2 = `${found.offset}:${found.encoding}`;
-        matchedModOffsets.add(k2);
-        if(o.text !== found.text){
-          changes.push({type:'Changed', orig:o, mod:found});
-        }
-      } else {
-        // not found => potential Removed
-        changes.push({type:'Removed', orig:o, mod:null});
-      }
+      // no decent match -> Removed
+      changes.push({type:'Removed', orig:o, mod:null});
     }
   }
 
-  // detect Added segments in modified that weren't matched
+  // 3) any mod segments not matched are Added
   for(const m of modSegments){
-    const key = `${m.offset}:${m.encoding}`;
-    if(!matchedModOffsets.has(key)){
-      // try to see if some original matched to it via fallback earlier: check proximity
-      let matched = false;
-      for(const o of origSegments){
-        if(o.encoding !== m.encoding) continue;
-        if(Math.abs(o.offset - m.offset) <= 16 && o.length === m.length){
-          matched = true; break;
-        }
+    const kM = `${m.offset}:${m.encoding}`;
+    if(matchedModKeys.has(kM)) continue;
+    // try tiny sanity check: maybe there's an orig nearby but we skipped due to earlier exact-match logic (avoid duplicates)
+    let near = false;
+    for(const o of origSegments){
+      if(o.encoding !== m.encoding) continue;
+      if(Math.abs(o.offset - m.offset) <= WINDOW){
+        const sim = similarity(o.text, m.text);
+        if(sim >= SIM_THRESH){ near = true; break; }
       }
-      if(!matched){
-        changes.push({type:'Added', orig:null, mod:m});
-      }
+    }
+    if(!near){
+      changes.push({type:'Added', orig:null, mod:m});
     }
   }
 
-  // Build output: only changed strings (Changed / Added / Removed)
-  // Output minimal information: for each change print single block:
-  // [Changed] encoding 0xorigOffset -> 0xmodOffset
-  // Original:
-  // <orig text>
-  // Modified:
-  // <mod text>
-  //
-  // For Added/Removed show only the present text under respective heading.
+  // Filter out any items that were exact matches (shouldn't be included but double-check)
+  const filtered = changes.filter(c=>{
+    if(c.type === 'Changed' && c.orig && c.mod && c.orig.text === c.mod.text) return false;
+    return true;
+  });
 
-  if(changes.length === 0){
-    out.value = ''; status.textContent = 'No changed strings found';
+  if(filtered.length === 0){
+    out.value = ''; status.textContent = 'No changed strings (after improved matching)';
     lastResultText = '';
     return;
   }
 
-  // Sort changes by original offset then mod offset
-  changes.sort((a,b)=>{
+  // Build minimal output
+  filtered.sort((a,b)=>{
     const ao = a.orig ? a.orig.offset : (a.mod ? a.mod.offset : 1e9);
     const bo = b.orig ? b.orig.offset : (b.mod ? b.mod.offset : 1e9);
     return ao - bo;
   });
 
   let outText = '';
-  for(const c of changes){
+  for(const c of filtered){
     if(c.type === 'Changed'){
-      outText += `[Changed] ${c.orig.encoding} 0x${c.orig.offset.toString(16)} -> 0x${c.mod.offset.toString(16)}\n`;
+      outText += `[Changed] ${c.orig.encoding} 0x${c.orig.offset.toString(16)} -> 0x${c.mod.offset.toString(16)} (sim ${(c.sim||0).toFixed(2)})\n`;
       outText += `Original:\n${c.orig.text}\n`;
       outText += `Modified:\n${c.mod.text}\n\n`;
     } else if(c.type === 'Removed'){
@@ -292,7 +286,7 @@ function runCompare(){
 
   out.value = outText.trim();
   lastResultText = out.value;
-  status.textContent = `Done — ${changes.length} changed/added/removed strings`;
+  status.textContent = `Done — ${filtered.length} changed/added/removed strings`;
 }
 </script>
 </body>
